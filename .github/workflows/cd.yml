@@ -1,0 +1,174 @@
+name: CD - Banco Andino BFF
+
+on:
+  workflow_run:
+    workflows:
+      - "CI - Banco Andino BFF"
+    types:
+      - completed
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  RESOURCE_GROUP: rg-banco-andino-cicd
+  ACR_NAME: acrbancoandino84621
+  ACR_LOGIN_SERVER: acrbancoandino84621.azurecr.io
+  IMAGE_NAME: banco-andino-bff
+  STAGING_APP: ca-banco-andino-bff-stg
+  PRODUCTION_APP: ca-banco-andino-bff-prod
+
+concurrency:
+  group: banco-andino-cd
+  cancel-in-progress: false
+
+jobs:
+  deploy-staging:
+    name: Deploy to staging
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: staging
+
+    steps:
+      - name: Checkout CI-validated commit
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Log in to Azure with OIDC
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Verify Azure authentication
+        run: az account show
+
+      - name: Log in to Azure Container Registry
+        run: az acr login --name "${{ env.ACR_NAME }}"
+
+      - name: Build CI-validated Docker image
+        run: >-
+          docker build
+          --tag "${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ github.event.workflow_run.head_sha }}"
+          .
+
+      - name: Push versioned image to ACR
+        run: >-
+          docker push
+          "${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ github.event.workflow_run.head_sha }}"
+
+      - name: Prepare Azure Container Apps CLI
+        run: az extension add --name containerapp --upgrade --allow-preview true
+
+      - name: Deploy versioned image to staging
+        run: >-
+          az containerapp update
+          --name "${{ env.STAGING_APP }}"
+          --resource-group "${{ env.RESOURCE_GROUP }}"
+          --image "${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ github.event.workflow_run.head_sha }}"
+
+      - name: Resolve staging endpoint
+        id: staging_endpoint
+        shell: bash
+        run: |
+          staging_fqdn="$(az containerapp show \
+            --name "${{ env.STAGING_APP }}" \
+            --resource-group "${{ env.RESOURCE_GROUP }}" \
+            --query properties.configuration.ingress.fqdn \
+            --output tsv)"
+
+          if [[ -z "$staging_fqdn" ]]; then
+            echo "Unable to resolve the staging FQDN."
+            exit 1
+          fi
+
+          echo "fqdn=$staging_fqdn" >> "$GITHUB_OUTPUT"
+
+      - name: Run staging health smoke test
+        shell: bash
+        run: |
+          health_response="$(curl \
+            --fail \
+            --show-error \
+            --silent \
+            --retry 10 \
+            --retry-delay 5 \
+            --retry-all-errors \
+            "https://${{ steps.staging_endpoint.outputs.fqdn }}/health")"
+
+          echo "$health_response"
+
+          if ! echo "$health_response" | grep --fixed-strings --quiet '"status":"ok"'; then
+            echo "Staging health response does not contain the expected status."
+            exit 1
+          fi
+
+  deploy-production:
+    name: Deploy to production
+    needs: deploy-staging
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: production
+
+    steps:
+      - name: Log in to Azure with OIDC
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Prepare Azure Container Apps CLI
+        run: az extension add --name containerapp --upgrade --allow-preview true
+
+      - name: Deploy staging-validated image to production
+        run: >-
+          az containerapp update
+          --name "${{ env.PRODUCTION_APP }}"
+          --resource-group "${{ env.RESOURCE_GROUP }}"
+          --image "${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ github.event.workflow_run.head_sha }}"
+
+      - name: Resolve production endpoint
+        id: production_endpoint
+        shell: bash
+        run: |
+          production_fqdn="$(az containerapp show \
+            --name "${{ env.PRODUCTION_APP }}" \
+            --resource-group "${{ env.RESOURCE_GROUP }}" \
+            --query properties.configuration.ingress.fqdn \
+            --output tsv)"
+
+          if [[ -z "$production_fqdn" ]]; then
+            echo "Unable to resolve the production FQDN."
+            exit 1
+          fi
+
+          echo "fqdn=$production_fqdn" >> "$GITHUB_OUTPUT"
+
+      - name: Run production health smoke test
+        shell: bash
+        run: |
+          health_response="$(curl \
+            --fail \
+            --show-error \
+            --silent \
+            --retry 10 \
+            --retry-delay 5 \
+            --retry-all-errors \
+            "https://${{ steps.production_endpoint.outputs.fqdn }}/health")"
+
+          echo "$health_response"
+
+          if ! echo "$health_response" | grep --fixed-strings --quiet '"status":"ok"'; then
+            echo "Production health response does not contain the expected status."
+            exit 1
+          fi
